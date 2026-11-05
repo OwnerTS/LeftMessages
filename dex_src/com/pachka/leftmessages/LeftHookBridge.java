@@ -92,13 +92,6 @@ public class LeftHookBridge {
     private static final Map<Integer, Integer> inToOutColors = new HashMap<>();
     private static volatile boolean inToOutColorsBuilt = false;
 
-    /** Resolved key ints for the out bubble colors (lazily). */
-    private static volatile boolean bubbleKeysResolved = false;
-    private static volatile boolean bubbleKeysValid = false;
-    private static int keyChatOutBubble;
-    private static int keyChatOutBubbleSelected;
-    private static Method themeGetColorMethod;
-
     /** Marker: a lying message's background color bake (setTop) is in progress on this thread. */
     private static final ThreadLocal<Boolean> lieBakeMarker = new ThreadLocal<Boolean>();
 
@@ -493,9 +486,12 @@ public class LeftHookBridge {
     };
 
     /**
-     * MessageDrawable.setTop(...) — the place where the bubble color is baked. With the
-     * scope marker set, apply the official overrideColor (out bubble palette) and restore
-     * the previous value afterwards, keeping the shared drawable safe for other messages.
+     * MessageDrawable.setTop(...) — the place where the bubble color is baked. The real
+     * out-bubble palette lives in the isOut branch (key_chat_outBubble + gradients +
+     * animated gradient handling), so for flipped messages we transiently flip the
+     * drawable's final isOut flag during the bake: the color is then resolved through the
+     * exact same pipeline a genuine outgoing bubble uses. Restored afterwards, keeping
+     * the shared drawable honest for everyone else.
      */
     private static final XC_MethodHook SET_TOP_HOOK = new XC_MethodHook() {
         @Override
@@ -504,44 +500,49 @@ public class LeftHookBridge {
                 if (!Boolean.TRUE.equals(lieBakeMarker.get())) {
                     return;
                 }
-                resolveBubbleKeys();
-                if (!bubbleKeysValid) {
+                Object drawable = param.thisObject;
+                if (getBoolField(drawable, "isOut", false)) {
+                    // Already an out drawable — nothing to flip.
+                    flippedHere.set(Boolean.FALSE);
                     return;
                 }
-                Object drawable = param.thisObject;
-                Object selected = getObjectField(drawable, "isSelected");
-                boolean isSel = selected instanceof Boolean && ((Boolean) selected).booleanValue();
-                Integer saved = (Integer) getObjectField(drawable, "overrideColor");
-                Field f = findField(drawable, "overrideColor");
-                if (f != null) {
-                    int colorKey = isSel ? keyChatOutBubbleSelected : keyChatOutBubble;
-                    int color = themeGetColor(colorKey);
-                    f.set(drawable, Integer.valueOf(color));
+                Field f = findField(drawable, "isOut");
+                if (f == null) {
+                    flippedHere.set(Boolean.FALSE);
+                    return;
                 }
-                // Remember the saved value on the thread for the after pass.
-                savedOverride.set(saved);
+                try {
+                    f.setBoolean(drawable, true);
+                    flippedHere.set(Boolean.TRUE);
+                } catch (Throwable t) {
+                    flippedHere.set(Boolean.FALSE);
+                }
             } catch (Throwable ignored) {
+                flippedHere.set(Boolean.FALSE);
             }
         }
 
         @Override
         protected void afterHookedMethod(MethodHookParam param) {
             try {
-                if (!Boolean.TRUE.equals(lieBakeMarker.get())) {
-                    return;
+                if (Boolean.TRUE.equals(flippedHere.get())) {
+                    Field f = findField(param.thisObject, "isOut");
+                    if (f != null) {
+                        f.setBoolean(param.thisObject, false);
+                    }
+                    flippedHere.set(Boolean.FALSE);
                 }
-                Integer saved = savedOverride.get();
-                Field f = findField(param.thisObject, "overrideColor");
-                if (f != null) {
-                    f.set(param.thisObject, saved);
-                }
-                savedOverride.set(null);
             } catch (Throwable ignored) {
             }
         }
     };
 
-    private static final ThreadLocal<Integer> savedOverride = new ThreadLocal<Integer>();
+    private static final ThreadLocal<Boolean> flippedHere = new ThreadLocal<Boolean>() {
+        @Override
+        protected Boolean initialValue() {
+            return Boolean.FALSE;
+        }
+    };
 
     // ---------------- python control API ----------------
 
@@ -767,48 +768,6 @@ public class LeftHookBridge {
     }
 
     private static final Object inToOutColorsBuiltLock = new Object();
-
-    private static void resolveBubbleKeys() {
-        if (bubbleKeysResolved) {
-            return;
-        }
-        synchronized (inToOutColorsBuiltLock) {
-            if (bubbleKeysResolved) {
-                return;
-            }
-            try {
-                Class<?> theme = Class.forName("org.telegram.ui.ActionBar.Theme", true,
-                        LeftHookBridge.class.getClassLoader());
-                keyChatOutBubble = getIntFieldStatic(theme, "key_chat_outBubble");
-                keyChatOutBubbleSelected = getIntFieldStatic(theme, "key_chat_outBubbleSelected");
-                themeGetColorMethod = theme.getMethod("getColor", int.class);
-                bubbleKeysValid = keyChatOutBubble != 0 && themeGetColorMethod != null;
-                bubbleKeysResolved = true;
-            } catch (Throwable t) {
-                log("resolveBubbleKeys: " + t);
-                bubbleKeysResolved = true;
-            }
-        }
-    }
-
-    private static int themeGetColor(int key) {
-        try {
-            Object value = themeGetColorMethod.invoke(null, Integer.valueOf(key));
-            return value instanceof Integer ? ((Integer) value).intValue() : 0;
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
-
-    private static int getIntFieldStatic(Class<?> clazz, String name) {
-        try {
-            Field f = clazz.getDeclaredField(name);
-            f.setAccessible(true);
-            return f.getInt(null);
-        } catch (Throwable t) {
-            return 0;
-        }
-    }
 
     // ---------------- misc reflection helpers (cached, safe) ----------------
 
