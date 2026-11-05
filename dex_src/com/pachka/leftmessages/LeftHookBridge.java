@@ -178,6 +178,13 @@ public class LeftHookBridge {
             hookByName(cellClass, "setBackgroundTopY", LIE_BAKE_SCOPE_HOOK);
             hookAll(mdClass, "setTop", SET_TOP_HOOK);
 
+            // 5b) Flat themes render the bubble as a cached nine-patch whose color is
+            //     resolved inside getBackgroundDrawable() via getColor(isOut ? out : in)
+            //     at draw time. Remap in->out keys there (marker-scoped) so the flat path
+            //     picks the out palette too; gradient themes are handled by SET_TOP_HOOK.
+            hookNoArgFirstInt(mdClass, "getColor", COLOR_KEY_REMAP_HOOK);
+            hookNoArgFirstInt(mdClass, "getCurrentColor", COLOR_KEY_REMAP_HOOK);
+
             // 6) Merge fix: suspend the lie while the adapter computes merge flags.
             Class<?> adapterClass = null;
             for (String name : new String[]{
@@ -482,6 +489,33 @@ public class LeftHookBridge {
         @Override
         protected void afterHookedMethod(MethodHookParam param) {
             lieBakeMarker.set(Boolean.FALSE);
+        }
+    };
+
+    /**
+     * MessageDrawable.getColor(int)/getCurrentColor(int) — inside the bake/draw scope of a
+     * flipped message, remap key_chat_in* keys to their key_chat_out* counterparts. This
+     * covers the flat-theme path where getBackgroundDrawable() resolves the nine-patch
+     * color at draw time, plus the bubble shadow key. Out keys pass through untouched, so
+     * the native isOut-branch (flipped in SET_TOP_HOOK) and this remap never conflict.
+     */
+    private static final XC_MethodHook COLOR_KEY_REMAP_HOOK = new XC_MethodHook() {
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) {
+            try {
+                if (!ownColors || !Boolean.TRUE.equals(lieBakeMarker.get())) {
+                    return;
+                }
+                buildColorRemap();
+                Integer mapped;
+                synchronized (inToOutColors) {
+                    mapped = inToOutColors.get((Integer) param.args[0]);
+                }
+                if (mapped != null) {
+                    param.args[0] = mapped;
+                }
+            } catch (Throwable ignored) {
+            }
         }
     };
 
