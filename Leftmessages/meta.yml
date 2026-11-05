@@ -1,0 +1,9 @@
+name: Left Messages
+description: "{description}"
+id: left_messages
+version: "1.0"
+author: "@swagnonher"
+icon: exteraPlugins/1
+app_version: ">=12.5.1"
+sdk_version: ">=1.4.3.8"
+elyx_version: ">=0.9.2b"

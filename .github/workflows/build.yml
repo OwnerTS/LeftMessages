@@ -1,0 +1,56 @@
+name: Build Plugin
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Restore Mandochka Toolchain & Build Cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.mandochka
+            Leftmessages/.mandochka/cache
+          key: ${{ runner.os }}-mandochka-${{ hashFiles('**/refmap.yml', '**/meta.yml', '**/config.yml', 'compile_stubs/**', 'dex_src/**', 'Leftmessages/src/**') }}
+          restore-keys: |
+            ${{ runner.os }}-mandochka-
+
+      - name: Install Mandochka
+        run: pip install mandochka
+
+      - name: Run Mandochka Doctor & Check
+        run: |
+          mandochka doctor
+          mandochka check
+
+      - name: Build Plugin Archive
+        run: |
+          mandochka build -c 2 -b
+          cp builds/*.eaf builds/LeftMessages-1.0.elyx
+
+      - name: Upload Build Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: LeftMessages-release
+          path: builds/*

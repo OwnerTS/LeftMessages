@@ -1,0 +1,18 @@
+zipFormat: eaf
+source: Leftmessages/src
+buildNameUncompiled: "LeftMessages-{version}"
+buildNameCompiled: "LeftMessages-{version}"
+ignoreAll:
+  - Leftmessages/.mandochka/cache/*
+compilationIgnore: []
+obfuscationConfig:
+  stripDocstrings: true
+  removeLogs: false
+  renameLocals: false
+dex:
+  enabled: true
+  source: dex_src
+  stubs: compile_stubs
+  output: Leftmessages/res/dex/classes.dex
+  minApi: 26
+  targetJava: 8

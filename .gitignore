@@ -1,0 +1,8 @@
+builds/
+**/__pycache__/
+*.pyc
+*.tmp
+.mandochka/cache/
+Leftmessages/.mandochka/cache/
+Leftmessages/.mandochka/stats.yml
+Leftmessages/res/dex/

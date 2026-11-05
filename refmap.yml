@@ -1,0 +1,5 @@
+metainfo: Leftmessages/meta.yml
+main: Leftmessages/src/main.pyc
+assets: Leftmessages/res
+strings: Leftmessages/locales
+mandochka: Leftmessages/.mandochka
