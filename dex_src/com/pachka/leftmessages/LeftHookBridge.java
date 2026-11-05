@@ -141,13 +141,15 @@ public class LeftHookBridge {
 
             // 2) Track rendered messages. Avatars are NOT suppressed: with the flip the
             //    incoming layout naturally shows avatar/name wherever it belongs, even
-            //    for the user's own messages.
+            //    for the user's own messages. The nickname/tag header above the bubble is
+            //    suppressed though (isNeedAuthorName -> false for flipped messages).
             for (Method m : cellClass.getDeclaredMethods()) {
                 if (m.getName().equals("setMessageObject") && m.getParameterTypes().length >= 1
                         && m.getParameterTypes()[0].getName().contains("MessageObject")) {
                     unhooks.add(XposedBridge.hookMethod(m, SET_MESSAGE_OBJECT_HOOK));
                 }
             }
+            hookNoArg(cellClass, "isNeedAuthorName", NEED_AUTHOR_NAME_HOOK);
 
             // 3) Album grid consistency: GroupedMessages.calculate() bakes the album layout
             //    for the real side (computed before cells bind), so force the lie during
@@ -506,6 +508,15 @@ public class LeftHookBridge {
                 if (!ownColors || !Boolean.TRUE.equals(lieBakeMarker.get())) {
                     return;
                 }
+                // Force the STATIC linear-gradient bake for flipped bubbles: the shared
+                // animated MotionBackground gets fought over by every cell during scroll
+                // (setColors + parent invalidations -> freezes). A static LinearGradient
+                // uses the same theme colors with zero per-frame rebuilds.
+                int animatedKey = getGradientAnimatedKey();
+                if (animatedKey > 0 && ((Integer) param.args[0]).intValue() == animatedKey) {
+                    param.setResult(Integer.valueOf(0));
+                    return;
+                }
                 buildColorRemap();
                 Integer mapped;
                 synchronized (inToOutColors) {
@@ -518,6 +529,37 @@ public class LeftHookBridge {
             }
         }
     };
+
+    private static volatile boolean gradientAnimatedKeyResolved = false;
+    private static int gradientAnimatedKey = -1;
+
+    private static int getGradientAnimatedKey() {
+        if (!gradientAnimatedKeyResolved) {
+            synchronized (inToOutColorsBuiltLock) {
+                if (!gradientAnimatedKeyResolved) {
+                    try {
+                        Class<?> theme = Class.forName("org.telegram.ui.ActionBar.Theme", true,
+                                LeftHookBridge.class.getClassLoader());
+                        gradientAnimatedKey = staticIntField(theme, "key_chat_outBubbleGradientAnimated");
+                    } catch (Throwable t) {
+                        gradientAnimatedKey = -1;
+                    }
+                    gradientAnimatedKeyResolved = true;
+                }
+            }
+        }
+        return gradientAnimatedKey;
+    }
+
+    private static int staticIntField(Class<?> clazz, String name) {
+        try {
+            Field f = clazz.getDeclaredField(name);
+            f.setAccessible(true);
+            return f.getInt(null);
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
 
     /**
      * MessageDrawable.setTop(...) — the place where the bubble color is baked. The real
@@ -578,6 +620,21 @@ public class LeftHookBridge {
         }
     };
 
+    /** isNeedAuthorName() -> false for flipped messages: no nickname/tag header on own bubbles. */
+    private static final XC_MethodHook NEED_AUTHOR_NAME_HOOK = new XC_MethodHook() {
+        @Override
+        protected void beforeHookedMethod(MethodHookParam param) {
+            try {
+                Object cell = param.thisObject;
+                Object mo = getObjectField(cell, "currentMessageObject");
+                if (shouldLie(mo)) {
+                    param.setResult(Boolean.FALSE);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    };
+
     // ---------------- python control API ----------------
 
     public void setEnabled(boolean value) {
@@ -585,6 +642,9 @@ public class LeftHookBridge {
         if (!value) {
             synchronized (clientUserIds) {
                 clientUserIds.clear();
+            }
+            synchronized (channelCache) {
+                channelCache.clear();
             }
         }
         refreshChatViews();
@@ -712,10 +772,57 @@ public class LeftHookBridge {
         if (!getBoolField(owner, "out", false)) {
             return false;
         }
+        if (isBroadcastChannel(messageObject)) {
+            // Channels (including own posts) keep the native look.
+            return false;
+        }
         if (!flipSaved && isSavedContext(messageObject)) {
             return false;
         }
         return true;
+    }
+
+    /** Cached per-dialog broadcast-channel check (channels are negative dialog ids). */
+    private static final Map<Long, Boolean> channelCache = new HashMap<>();
+
+    private static boolean isBroadcastChannel(Object messageObject) {
+        try {
+            long dialogId = invokeLong(messageObject, "getDialogId");
+            if (dialogId >= 0L) {
+                return false;
+            }
+            Boolean cached;
+            synchronized (channelCache) {
+                cached = channelCache.get(Long.valueOf(dialogId));
+            }
+            if (cached != null) {
+                return cached.booleanValue();
+            }
+            boolean broadcast = false;
+            int account = getIntField(messageObject, "currentAccount", 0);
+            Class<?> mcClass = Class.forName("org.telegram.messenger.MessagesController", true,
+                    LeftHookBridge.class.getClassLoader());
+            Object mc = mcClass.getMethod("getInstance", int.class).invoke(null, Integer.valueOf(account));
+            Object chat = null;
+            try {
+                chat = mcClass.getMethod("getChat", Long.class).invoke(mc, Long.valueOf(-dialogId));
+            } catch (Throwable t) {
+                chat = mcClass.getMethod("getChat", long.class).invoke(mc, Long.valueOf(-dialogId));
+            }
+            if (chat != null) {
+                Class<?> chatObject = Class.forName("org.telegram.messenger.ChatObject", true,
+                        LeftHookBridge.class.getClassLoader());
+                Object value = chatObject.getMethod("isChannelAndNotMegaGroup", chat.getClass())
+                        .invoke(null, chat);
+                broadcast = value instanceof Boolean && ((Boolean) value).booleanValue();
+            }
+            synchronized (channelCache) {
+                channelCache.put(Long.valueOf(dialogId), Boolean.valueOf(broadcast));
+            }
+            return broadcast;
+        } catch (Throwable t) {
+            return false;
+        }
     }
 
     private static boolean isSavedContext(Object messageObject) {
@@ -783,6 +890,11 @@ public class LeftHookBridge {
                     for (Map.Entry<String, Integer> e : ints.entrySet()) {
                         String name = e.getKey();
                         if (!name.startsWith("key_chat_in")) {
+                            continue;
+                        }
+                        // Shadows are subtle and their cached bitmaps are expensive to
+                        // re-render on every in<->out alternation: keep them untouched.
+                        if (name.endsWith("Shadow")) {
                             continue;
                         }
                         String outName = "key_chat_out" + name.substring("key_chat_in".length());
