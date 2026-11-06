@@ -120,6 +120,9 @@ public class LeftHookBridge {
         synchronized (rendered) {
             rendered.clear();
         }
+        synchronized (privateDrawables) {
+            privateDrawables.clear();
+        }
         lastBinds.clear();
     }
 
@@ -150,6 +153,12 @@ public class LeftHookBridge {
                 }
             }
             hookNoArg(cellClass, "isNeedAuthorName", NEED_AUTHOR_NAME_HOOK);
+
+            // 2b) Private bubble drawables: flipped cells get their own MessageDrawable
+            //     instances (incoming geometry, out palette) instead of sharing the
+            //     application-wide incoming drawable with the other person's messages.
+            //     This kills the state thrash that made gradients freeze while scrolling.
+            hookByStringParam(cellClass, "getThemedDrawable", GET_THEMED_DRAWABLE_HOOK);
 
             // 3) Album grid consistency: GroupedMessages.calculate() bakes the album layout
             //    for the real side (computed before cells bind), so force the lie during
@@ -269,6 +278,22 @@ public class LeftHookBridge {
         }
     }
 
+    private static void hookByStringParam(Class<?> clazz, String name, XC_MethodHook hook) {
+        try {
+            for (Method m : clazz.getDeclaredMethods()) {
+                Class<?>[] p = m.getParameterTypes();
+                if (m.getName().equals(name) && p.length == 1 && p[0] == String.class) {
+                    unhooks.add(XposedBridge.hookMethod(m, hook));
+                    log("Hooked " + clazz.getSimpleName() + "." + name);
+                    return;
+                }
+            }
+            log("Method not found: " + clazz.getSimpleName() + "." + name);
+        } catch (Throwable t) {
+            log("Failed to hook " + clazz.getSimpleName() + "." + name + ": " + t);
+        }
+    }
+
     private static void hookByFirstParamName(Class<?> clazz, String name, XC_MethodHook hook) {
         try {
             for (Method m : clazz.getDeclaredMethods()) {
@@ -313,17 +338,43 @@ public class LeftHookBridge {
 
     // ---------------- hooks ----------------
 
-    /** Core flip: MessageObject.isOutOwner() -> false while rendered (unless suspended). */
+    /**
+     * Core flip: MessageObject.isOutOwner() -> false while rendered.
+     *
+     * Implemented as an AFTER hook on purpose: the original method already decided the
+     * real semantics (own post in a channel -> false, forwarded -> per saved_from,
+     * previews, welcome messages, the isOutOwnerCached bookkeeping). We never re-derive
+     * that logic ourselves — if the client said "outOwner" and the message is currently
+     * bound to a chat cell (and not excluded by scope rules), we simply invert the
+     * answer. Everything else (channel posts, previews, anything the client considers
+     * non-owned) passes through completely untouched, so no downstream consumer ever
+     * sees a half-lie.
+     */
     private static final XC_MethodHook OUT_OWNER_HOOK = new XC_MethodHook() {
         @Override
-        protected void beforeHookedMethod(MethodHookParam param) {
+        protected void afterHookedMethod(MethodHookParam param) {
             try {
-                if (outOwnerSuspensions > 0) {
+                if (!enabled || outOwnerSuspensions > 0) {
                     return; // merge-flag computation: use the real value
                 }
-                if (shouldLie(param.thisObject)) {
-                    param.setResult(Boolean.FALSE);
+                if (!Boolean.TRUE.equals(param.getResult())) {
+                    return; // the client itself says this is not an owned message
                 }
+                Object mo = param.thisObject;
+                boolean inRendered;
+                synchronized (rendered) {
+                    inRendered = rendered.contains(mo);
+                }
+                if (!inRendered) {
+                    return;
+                }
+                if (isBroadcastChannel(mo)) {
+                    return;
+                }
+                if (!flipSaved && isSavedContext(mo)) {
+                    return;
+                }
+                param.setResult(Boolean.FALSE);
             } catch (Throwable ignored) {
             }
         }
@@ -500,21 +551,14 @@ public class LeftHookBridge {
      * covers the flat-theme path where getBackgroundDrawable() resolves the nine-patch
      * color at draw time, plus the bubble shadow key. Out keys pass through untouched, so
      * the native isOut-branch (flipped in SET_TOP_HOOK) and this remap never conflict.
+     * With private drawables these hooks only ever fire for the flipped message's own
+     * drawable, so nothing is shared with the other person's bubbles.
      */
     private static final XC_MethodHook COLOR_KEY_REMAP_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
             try {
                 if (!ownColors || !Boolean.TRUE.equals(lieBakeMarker.get())) {
-                    return;
-                }
-                // Force the STATIC linear-gradient bake for flipped bubbles: the shared
-                // animated MotionBackground gets fought over by every cell during scroll
-                // (setColors + parent invalidations -> freezes). A static LinearGradient
-                // uses the same theme colors with zero per-frame rebuilds.
-                int animatedKey = getGradientAnimatedKey();
-                if (animatedKey > 0 && ((Integer) param.args[0]).intValue() == animatedKey) {
-                    param.setResult(Integer.valueOf(0));
                     return;
                 }
                 buildColorRemap();
@@ -529,37 +573,6 @@ public class LeftHookBridge {
             }
         }
     };
-
-    private static volatile boolean gradientAnimatedKeyResolved = false;
-    private static int gradientAnimatedKey = -1;
-
-    private static int getGradientAnimatedKey() {
-        if (!gradientAnimatedKeyResolved) {
-            synchronized (inToOutColorsBuiltLock) {
-                if (!gradientAnimatedKeyResolved) {
-                    try {
-                        Class<?> theme = Class.forName("org.telegram.ui.ActionBar.Theme", true,
-                                LeftHookBridge.class.getClassLoader());
-                        gradientAnimatedKey = staticIntField(theme, "key_chat_outBubbleGradientAnimated");
-                    } catch (Throwable t) {
-                        gradientAnimatedKey = -1;
-                    }
-                    gradientAnimatedKeyResolved = true;
-                }
-            }
-        }
-        return gradientAnimatedKey;
-    }
-
-    private static int staticIntField(Class<?> clazz, String name) {
-        try {
-            Field f = clazz.getDeclaredField(name);
-            f.setAccessible(true);
-            return f.getInt(null);
-        } catch (Throwable t) {
-            return -1;
-        }
-    }
 
     /**
      * MessageDrawable.setTop(...) — the place where the bubble color is baked. The real
@@ -634,6 +647,71 @@ public class LeftHookBridge {
             }
         }
     };
+
+    /**
+     * ChatMessageCell.getThemedDrawable(String) — flipped cells receive PRIVATE
+     * MessageDrawable instances (one per drawableMsgIn* key) instead of the shared
+     * application-wide incoming drawable. The private instances hold incoming geometry
+     * with the outgoing palette baked through the same hooks as before, but since no
+     * other message ever touches them, their color state never thrashes against the
+     * other person's bubbles — gradients stay smooth while scrolling, exactly like the
+     * official client.
+     */
+    private static final XC_MethodHook GET_THEMED_DRAWABLE_HOOK = new XC_MethodHook() {
+        @Override
+        protected void afterHookedMethod(MethodHookParam param) {
+            try {
+                if (!ownColors) {
+                    return;
+                }
+                String key = (String) param.args[0];
+                if (key == null || !key.startsWith("drawableMsgIn")) {
+                    return;
+                }
+                Object cell = param.thisObject;
+                Object mo = getObjectField(cell, "currentMessageObject");
+                if (!shouldLie(mo)) {
+                    return;
+                }
+                Object replacement = privateDrawableFor(key, param.getResult());
+                if (replacement != null) {
+                    param.setResult(replacement);
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    };
+
+    private static final Map<String, Object> privateDrawables = new HashMap<>();
+
+    private static Object privateDrawableFor(String key, Object themeDrawable) {
+        synchronized (privateDrawables) {
+            Object existing = privateDrawables.get(key);
+            if (existing != null) {
+                return existing;
+            }
+        }
+        try {
+            Class<?> mdClass = Class.forName("org.telegram.ui.ActionBar.MessageDrawable", true,
+                    LeftHookBridge.class.getClassLoader());
+            int type = getIntField(themeDrawable, "currentType", 0);
+            boolean selected = getBoolField(themeDrawable, "isSelected", false);
+            Object instance = mdClass.getConstructor(int.class, boolean.class, boolean.class)
+                    .newInstance(Integer.valueOf(type), Boolean.FALSE, Boolean.valueOf(selected));
+            synchronized (privateDrawables) {
+                Object raced = privateDrawables.get(key);
+                if (raced != null) {
+                    return raced;
+                }
+                privateDrawables.put(key, instance);
+                log("Private drawable created for " + key);
+                return instance;
+            }
+        } catch (Throwable t) {
+            log("privateDrawableFor(" + key + "): " + t);
+            return null;
+        }
+    }
 
     // ---------------- python control API ----------------
 
@@ -765,11 +843,14 @@ public class LeftHookBridge {
                 return false;
             }
         }
-        Object owner = getObjectField(messageObject, "messageOwner");
-        if (owner == null) {
-            return false;
-        }
-        if (!getBoolField(owner, "out", false)) {
+        // The client maintains its own isOutOwner bookkeeping in this public cache field
+        // (posts in channels, forwards, previews and welcome messages included). Trust it
+        // instead of re-deriving "out" semantics: a raw messageOwner.out flag says nothing
+        // about whether the client actually renders the message as owned.
+        Boolean cached = (Boolean) getObjectField(messageObject, "isOutOwnerCached");
+        boolean originalOut = cached != null ? cached.booleanValue()
+                : getBoolField(getObjectField(messageObject, "messageOwner"), "out", false);
+        if (!originalOut) {
             return false;
         }
         if (isBroadcastChannel(messageObject)) {
@@ -890,11 +971,6 @@ public class LeftHookBridge {
                     for (Map.Entry<String, Integer> e : ints.entrySet()) {
                         String name = e.getKey();
                         if (!name.startsWith("key_chat_in")) {
-                            continue;
-                        }
-                        // Shadows are subtle and their cached bitmaps are expensive to
-                        // re-render on every in<->out alternation: keep them untouched.
-                        if (name.endsWith("Shadow")) {
                             continue;
                         }
                         String outName = "key_chat_out" + name.substring("key_chat_in".length());
