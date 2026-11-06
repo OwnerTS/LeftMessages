@@ -184,8 +184,11 @@ public class LeftHookBridge {
             hookNoArgFirstInt(cellClass, "getThemedColor", GET_THEMED_COLOR_HOOK);
 
             // 5) Own bubble colors: transient overrideColor around background color bakes.
+            //    drawBackgroundInParent covers grouped messages (albums / grouped files)
+            //    whose group background is drawn through the parent pass.
             hookByFirstParam(cellClass, "drawBackground", Canvas.class, LIE_BAKE_SCOPE_HOOK);
             hookByFirstParam(cellClass, "drawBackgroundInternal", Canvas.class, LIE_BAKE_SCOPE_HOOK);
+            hookByName(cellClass, "drawBackgroundInParent", LIE_BAKE_SCOPE_HOOK);
             hookByName(cellClass, "setBackgroundTopY", LIE_BAKE_SCOPE_HOOK);
             hookAll(mdClass, "setTop", SET_TOP_HOOK);
 
@@ -525,23 +528,35 @@ public class LeftHookBridge {
 
     /**
      * Scope marker: while one of the cell's background color-bake methods runs for a lying
-     * message, MessageDrawable.setTop must override the bubble color.
+     * message, MessageDrawable.setTop must override the bubble color. These methods nest
+     * (drawBackground -> drawBackgroundInternal), so the previous marker value is saved
+     * and restored instead of blindly cleared — the outer scope keeps its remap active
+     * after an inner scope finishes.
      */
     private static final XC_MethodHook LIE_BAKE_SCOPE_HOOK = new XC_MethodHook() {
         @Override
         protected void beforeHookedMethod(MethodHookParam param) {
             try {
+                lieBakeSaved.set(Boolean.valueOf(Boolean.TRUE.equals(lieBakeMarker.get())));
                 Object cell = param.thisObject;
                 Object mo = getObjectField(cell, "currentMessageObject");
                 lieBakeMarker.set(Boolean.valueOf(shouldLie(mo) && ownColors));
             } catch (Throwable ignored) {
+                lieBakeSaved.set(Boolean.FALSE);
                 lieBakeMarker.set(Boolean.FALSE);
             }
         }
 
         @Override
         protected void afterHookedMethod(MethodHookParam param) {
-            lieBakeMarker.set(Boolean.FALSE);
+            lieBakeMarker.set(lieBakeSaved.get());
+        }
+    };
+
+    private static final ThreadLocal<Boolean> lieBakeSaved = new ThreadLocal<Boolean>() {
+        @Override
+        protected Boolean initialValue() {
+            return Boolean.FALSE;
         }
     };
 
